@@ -22,6 +22,11 @@ const SOURCE: &str = "@DEFAULT_AUDIO_SOURCE@";
 pub struct State {
     pub volume: Option<u32>,
     pub muted: bool,
+    /// Capture volume and mute, for the microphones. Separate fields rather than
+    /// reusing the ones above: the speaker and the mic array are independent
+    /// controls and a panel shows them as such.
+    pub source_volume: Option<u32>,
+    pub source_muted: bool,
     pub sink: Option<String>,
     pub source: Option<String>,
     pub sink_is_hub: bool,
@@ -52,6 +57,7 @@ impl Audio {
 
     fn refresh(&self) {
         let vol = run("wpctl", &["get-volume", SINK], T);
+        let src_vol = run("wpctl", &["get-volume", SOURCE], T);
         let sink = describe(SINK);
         let source = describe(SOURCE);
         let mut st = self.st.lock().unwrap();
@@ -66,6 +72,18 @@ impl Audio {
             .and_then(|v| v.parse::<f32>().ok())
             .map(|v| (v * 100.0).round() as u32);
         st.muted = vol.text.contains("MUTED");
+        // Capture side. A missing source is not an error the way a missing sink
+        // is -- a unit with no working mic should still report its speaker -- so
+        // this is parsed best-effort and left as None if wpctl had nothing.
+        if src_vol.ok {
+            st.source_volume = src_vol
+                .text
+                .split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<f32>().ok())
+                .map(|v| (v * 100.0).round() as u32);
+            st.source_muted = src_vol.text.contains("MUTED");
+        }
         st.sink_is_hub = sink.as_deref().is_some_and(is_hub);
         st.sink = sink;
         st.source = source;
@@ -79,6 +97,32 @@ impl Audio {
             return Err(last_line(&out.text));
         }
         self.st.lock().unwrap().volume = Some(v);
+        Ok(())
+    }
+
+    /// Capture volume for the microphone array. The same wpctl path as the
+    /// speaker, against the default source instead of the default sink -- unlike
+    /// the speaker, nothing in the audio path ignores this one.
+    pub fn set_source_volume(&self, value: u32) -> Result<(), String> {
+        let v = value.min(100);
+        let out = run(
+            "wpctl",
+            &["set-volume", SOURCE, &format!("{:.2}", v as f32 / 100.0)],
+            T,
+        );
+        if !out.ok {
+            return Err(last_line(&out.text));
+        }
+        self.st.lock().unwrap().source_volume = Some(v);
+        Ok(())
+    }
+
+    pub fn set_source_mute(&self, on: bool) -> Result<(), String> {
+        let out = run("wpctl", &["set-mute", SOURCE, if on { "1" } else { "0" }], T);
+        if !out.ok {
+            return Err(last_line(&out.text));
+        }
+        self.st.lock().unwrap().source_muted = on;
         Ok(())
     }
 
