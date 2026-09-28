@@ -24,6 +24,11 @@ records what the hardware does; this one turns it into code.
 | `audio` | Speaker output via PipeWire | Hardware volume does nothing: a Harman DSP ignores USB Audio Class volume requests, so the output is pinned at maximum. Software volume is the only control |
 | `mic` | Dual omni microphone array | Whether Linux sees two usable capsules or a pre-mixed pair is still an open question |
 | `hid` | Read-only raw HID capture | For the undocumented devices, notably `17ef:60ce` |
+| `media` | Audio devices through PipeWire | WirePlumber scores the HDMI capture card's audio like an ordinary microphone and will make it the default **source**. On two of three units here it had. Every app asking for "the microphone" then gets the HDMI input, which answers — with silence |
+| `video` | Capture devices through V4L2 | Every device presents two `/dev/video*` nodes; the metadata one enumerates no capture formats, which is how to tell them apart. Controls carry V4L2's inactive flag, and an inactive control accepts writes and ignores them |
+| `preview` | Live frames from a capture device | See *Video decode* below. Also: `v4l2-ctl` writes progress markers to **stdout**, interleaved with the frames, unless given `--silent` |
+| `vaapi` | What the GPU can decode and encode | See *Video decode* below |
+| `screen` | Screenshots of the panel itself | These units have no keyboard and are worked on over ssh. "What does it actually look like" is otherwise unanswerable |
 | `inventory` | One-shot hardware description | Cheap to regenerate; never polled |
 | `util` | Shared process and file helpers | Includes the bounded-child-process primitive everything above depends on |
 
@@ -47,6 +52,73 @@ it is shaped the way it is.
   `17ef:60c0` alone is not enough. `jethac/thinksmart-fleet` ships the udev rule.
 - Recovering a wedged sensor needs a USB reset: write `0` then `1` to the port's
   `authorized`, found by vendor/product rather than a fixed path.
+
+## Video decode, and a driver trap
+
+The GPU is an **Intel HD Graphics 630** (`8086:5912`, Kaby Lake GT2, `i915`,
+`/dev/dri/renderD128`). With `intel-media-va-driver-non-free` it reports:
+
+```
+decode   MPEG-2, H.264 Main/High/ConstrainedBaseline, JPEG Baseline,
+         VP8, VP9 profile 0 and 2, HEVC Main and Main10
+encode   H.264 (EncSlice and the low-power EncSliceLP), JPEG
+```
+
+**There is no VP8 or VP9 encode.** Decode for both, encode for neither. WebRTC
+commonly negotiates VP8 outbound, and if it does, this box software-encodes on
+four 2.7 GHz cores while the H.264 encoder sits idle. Pin outbound video to
+H.264, and assert it rather than hoping — a silent fallback presents as "calls
+run a bit hot" rather than as a misconfiguration.
+
+### The driver trap
+
+Debian's **free** `intel-media-va-driver` has no video post-processing on this
+chip: 15 entrypoints, no `VAEntrypointVideoProc`. The DFSG repack strips Intel's
+Gen9 post-processing kernels (`igvpkrn_g9.c` and its ISA twin) because they are
+source-less binaries, and VPP on this generation is entirely shader-based, so
+removing them removes the entrypoint. Decode survives, being fixed-function.
+
+That leaves **decode without scaling, which is the worst combination available**,
+because GPU decode alone is worth nothing here. Measured over 120 frames of
+1080p MJPEG: software 3.19 s, hardware-decode-without-scaling 3.24 s. The entire
+win is scaling *before* the frame is copied back — 345 KB instead of 3.1 MB —
+and that needs VPP. With it: **7.39 ms a frame against 37.67**, 5.1x, which at
+rate is the difference between needing 113% of a core to hold 30 fps and needing
+22%.
+
+So either install `intel-media-va-driver-non-free` (needs `non-free` in your apt
+sources; the two intel-media packages **conflict**, so it is a swap) or keep the
+legacy `i965-va-driver`, which has VPP and is what this crate used first. On the
+same workload the two are indistinguishable — 251, 234, 196 and 306 ms for 120
+frames, alternating — so the run-to-run spread is wider than the gap. This crate
+now tries iHD first because i965 is frozen upstream at 2.4.1, and keeps i965 as
+the fallback.
+
+`LIBVA_DRIVER_NAME` is set **per child process**, never system-wide: a browser
+encoding a call may want a different driver from the one decoding a preview.
+
+## Things this hardware will do to you
+
+A list for anyone else who has bought one of these.
+
+- **The PIR sensor can hang a task nothing can kill.** See above. This is the
+  one that actually costs you a reboot.
+- **`pgrep` will not find a process named 15+ characters.** The kernel truncates
+  `comm`; `straylight-panel` appears as `straylight-pane`. `ps -C` and
+  `pgrep -f` work. It fails silently and confidently.
+- **The Wayland socket has a `.lock` beside it.** Picking `wayland-0.lock` gives
+  you a `WAYLAND_DISPLAY` that looks entirely plausible and connects to nothing.
+- **`/sys/class/drm/*/modes` lists this panel's mode twice.** Take the first
+  line; it is the preferred one.
+- **The compositor will let a client decorate itself.** Under `cage`, without
+  `-d`, the panel runs 1920x1045 inside a 1920x1080 display: a titlebar's worth
+  of height reserved and never painted. Invisible in every log; obvious in one
+  screenshot.
+- **The HDMI capture card never stops sending frames.** With nothing plugged in
+  it sends Y=16 black, so "no signal" never fires and a preview pane just looks
+  broken.
+- **A capture device with no signal can block in the kernel.** Which is why
+  everything external here is a child process with a deadline.
 
 ## Using it
 

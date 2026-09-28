@@ -202,13 +202,29 @@ const ALL: [Codec; 7] = [
 /// The order is not arbitrary and is the opposite of what the modern advice
 /// would be. On this hardware -- Kaby Lake, Debian 13 -- the maintained iHD
 /// driver reports 15 entrypoints and **no** `VAEntrypointVideoProc`, while the
-/// legacy i965 driver reports 28 and has it. Without VPP the hardware path is
-/// worth nothing (see [`Capabilities::can_post_process`]), so the old driver is
-/// the one that works and is tried first.
+/// legacy i965 driver reports 28 and has it -- which is why i965 was tried first
+/// for a while, and why the order has since changed.
+///
+/// The gap was never about the chip. Debian's DFSG repack strips Intel's Gen9
+/// post-processing kernels, which ship as source-less binaries, and VPP on this
+/// generation is entirely shader-based, so removing them removes the entrypoint.
+/// Decode survives because it is fixed-function. The fleet now installs
+/// `intel-media-va-driver-non-free`, which has the kernels: 32 entrypoints,
+/// post-processing present, and the full `VAEntrypointEncSlice` H.264 encoder
+/// rather than only the low-power path.
+///
+/// With both drivers working, iHD is tried first on grounds that are not
+/// performance. Measured on the same workload the preview runs, 120 frames
+/// alternating between them, the times were 251ms, 234ms, 196ms and 306ms: the
+/// run-to-run spread is wider than any difference between the drivers, so speed
+/// does not choose. What chooses is that i965 is frozen upstream at 2.4.1 and
+/// iHD is maintained, and that iHD carries the encoder the call work will need.
+/// i965 stays as the fallback rather than being dropped, because a unit whose
+/// non-free driver is missing should still get hardware decode.
 ///
 /// An empty name means "whatever libva picks by itself", tried last so that a
 /// unit with neither of the named drivers still gets an answer.
-const DRIVER_CANDIDATES: [&str; 3] = ["i965", "iHD", ""];
+const DRIVER_CANDIDATES: [&str; 3] = ["iHD", "i965", ""];
 
 /// A hardware path that actually works: a driver that can both decode the codec
 /// and post-process, which is the pair that makes acceleration worth using.
