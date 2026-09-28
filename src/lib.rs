@@ -19,6 +19,8 @@
 //!   had picked the HDMI capture card instead.
 //! - [`video`] Capture devices through V4L2: the built-in HDMI card, and a USB
 //!   webcam where one is fitted.
+//! - [`preview`] Live frames from one of those, for a preview pane. YUYV and
+//!   MJPEG, because the two devices here each offer only one of them.
 //! - [`hid`] Read-only raw HID capture, for the undocumented devices.
 //! - [`inventory`] A one-shot description of the hardware.
 //! - [`util`] Process and file helpers every backend shares, including the
@@ -35,6 +37,7 @@ pub mod inventory;
 pub mod led;
 pub mod media;
 pub mod mic;
+pub mod preview;
 pub mod prox;
 pub mod video;
 pub mod util;
