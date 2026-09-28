@@ -24,7 +24,7 @@ Every number below was measured on these units. There is no datasheet.
 | `preview` | Live frames | `v4l2-ctl` writes progress markers to stdout, interleaved with frames, without `--silent` |
 | `vaapi` | GPU decode/encode capability | See below |
 | `screen` | Screenshots, via `grim` | These have no keyboard; this is how you see the screen over ssh |
-| `bluetooth` | The radio, nearby devices, pairing | The adapter is a combo part and comes up on its own, but nothing in userspace is installed by default. A discovery session dies with the D-Bus connection that started it, so scanning cannot be a one-shot |
+| `bluetooth` | The radio, nearby devices, pairing | The adapter is a combo part and comes up on its own, but nothing in userspace is installed by default. A discovery session dies with the D-Bus connection that started it, so scanning cannot be a one-shot, and neither can pairing: bluez asks questions that have to reach a person |
 | `hid` | Raw HID capture | For undocumented devices, notably `17ef:60ce` |
 | `inventory` | One-shot hardware description | |
 | `util` | Bounded-child-process primitive | Everything external goes through it |
@@ -113,8 +113,43 @@ for its duration: `bluetoothctl --timeout N scan on` as a held child.
 appeared and 23 had vanished between listing the paths and reading their
 properties. Skip them; that is the normal behaviour, not an error.
 
-Pairing needs an agent to answer bluez's prompts, which `bluetoothctl`
-registers and a raw `Device1.Pair` call does not.
+### Pairing is a conversation
+
+Pairing needs an **agent**: an object bluez makes method calls *to*, part way
+through, and will not proceed until something answers. `bluetoothctl` registers
+one and answers inside its own REPL, which is no use if the answer has to reach
+a person. A raw `Device1.Pair` with no agent registered gets as far as the first
+question and fails.
+
+An agent cannot be a `busctl` call, because `busctl` is a client and this is a
+served object. This crate uses `zbus` for that one job — pure Rust, so it adds
+no C library and no development package.
+
+Which question arrives is decided by Secure Simple Pairing from the two ends'
+declared capability, and the interesting one is the keyboard:
+
+| This end | Other end | Question here |
+|---|---|---|
+| `KeyboardDisplay` | `KeyboardOnly` (a keyboard) | `DisplayPasskey` — show it, they type it on the keyboard |
+| `KeyboardDisplay` | `KeyboardDisplay` | `RequestConfirmation` — both show a number, somebody says it matches |
+| `KeyboardDisplay` | `NoInputNoOutput` | nothing; it just pairs |
+
+`DisplayPasskey` does **not** block: bluez hands over the number and carries on,
+and the pairing completes when the right digits are typed on the device. It is
+then called again with a rising `entered` as each key is pressed, which is the
+only feedback that somebody is typing on the right keyboard.
+
+**A passkey is six digits and bluez sends it as an integer.** A passkey of 1234
+must be shown as `001234`; display it unpadded and the digits typed will not
+match and the pairing will simply fail.
+
+**An agent dies with the connection that registered it**, exactly as a discovery
+session does. Hold the connection open for the pairing. Make the `Pair` call on a
+*second* connection, or waiting for its reply starves the dispatch of the
+questions that reply is waiting for.
+
+Nothing imposes a deadline on `Pair` — neither the bus nor `zbus` — which is what
+somebody typing six digits needs. The bounds that exist have to be your own.
 
 Most of what a scan finds in a house is nameless BLE randoms with no `Icon` and
 no `Class` — 16 of 16 on one run, 37 of 39 on another. Filter to paired devices

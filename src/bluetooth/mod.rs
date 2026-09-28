@@ -58,6 +58,10 @@
 //! device that disappears mid-enumeration is skipped rather than reported as an
 //! error, because it is the normal behaviour of the thing being enumerated.
 
+pub mod agent;
+
+pub use agent::{Answer, Pairing, Stage};
+
 use crate::util::{run, run_env, RunError};
 use serde::Serialize;
 use serde_json::Value;
@@ -264,6 +268,9 @@ fn map_run(e: RunError) -> BtError {
 pub struct Bluetooth {
     st: Mutex<State>,
     scanning: AtomicBool,
+    /// Shared with the bluez agent, which is called into from another thread
+    /// while a pairing is in flight.
+    pairing: Arc<agent::Shared>,
 }
 
 impl Bluetooth {
@@ -271,6 +278,7 @@ impl Bluetooth {
         Arc::new(Self {
             st: Mutex::new(State::default()),
             scanning: AtomicBool::new(false),
+            pairing: Arc::new(agent::Shared::new()),
         })
     }
 
@@ -402,19 +410,82 @@ impl Bluetooth {
         self.scanning.load(Ordering::Relaxed)
     }
 
-    /// Pair with a device.
+    /// Begin pairing, and return at once.
     ///
-    /// Through `bluetoothctl` rather than `busctl`, and this is the one place
-    /// that is the right way round: pairing needs an agent to answer bluez's
-    /// questions -- confirm this passkey, enter this PIN -- and bluetoothctl
-    /// registers one. A raw `Device1.Pair` call with no agent registered gets as
-    /// far as a device that asks something and then fails.
+    /// Pairing is not a call that either works or does not: bluez asks questions
+    /// part way through and waits for answers, and for a keyboard the question
+    /// is a number that has to be typed on the keyboard itself. So this starts
+    /// the process and the caller watches [`pairing`](Self::pairing), answering
+    /// with [`confirm`](Self::confirm), [`submit_pin`](Self::submit_pin) or
+    /// [`submit_passkey`](Self::submit_passkey) when asked.
     ///
-    /// A keyboard typically wants a passkey typed on the keyboard itself, which
-    /// this cannot show. That path is unexercised here and a page offering it
-    /// should not promise it works.
-    pub fn pair(&self, address: &str) -> Result<(), BtError> {
-        self.ctl(&["pair", address])
+    /// The old one-shot `pair()` could not do this. It shelled out to
+    /// `bluetoothctl`, whose agent answers bluez inside its own REPL, so a
+    /// passkey was shown to nobody and a confirmation was answered by a program
+    /// that had not asked anyone.
+    pub fn start_pairing(self: &Arc<Self>, address: &str) {
+        match radio_state() {
+            Radio::Absent => {
+                self.pairing.set(Pairing::Failed {
+                    address: address.to_string(),
+                    stage: Stage::Registering,
+                    reason: "no Bluetooth adapter".into(),
+                });
+                return;
+            }
+            Radio::Blocked => {
+                self.pairing.set(Pairing::Failed {
+                    address: address.to_string(),
+                    stage: Stage::Registering,
+                    reason: "the radio is blocked by rfkill".into(),
+                });
+                return;
+            }
+            _ => {}
+        }
+
+        self.pairing.begin(address);
+        let me = self.clone();
+        let address = address.to_string();
+        thread::spawn(move || {
+            let shared = me.pairing.clone();
+            if let Err(e) = run_pairing(&shared, &address) {
+                // Only overwrite if the agent has not already recorded something
+                // more specific, which it will have for anything it was asked.
+                if !shared.get().finished() {
+                    shared.set(e);
+                }
+            }
+            me.refresh();
+        });
+    }
+
+    /// Where a pairing has got to.
+    pub fn pairing(&self) -> Pairing {
+        self.pairing.get()
+    }
+
+    /// Answer a confirmation or an authorisation.
+    pub fn confirm(&self, yes: bool) {
+        self.pairing.answer(Answer::Confirm(yes));
+    }
+
+    /// Answer a request for a PIN typed on this machine.
+    pub fn submit_pin(&self, pin: &str) {
+        self.pairing.answer(Answer::Pin(pin.to_string()));
+    }
+
+    /// Answer a request for a passkey typed on this machine.
+    pub fn submit_passkey(&self, passkey: u32) {
+        self.pairing.answer(Answer::Passkey(passkey));
+    }
+
+    /// Give up on a pairing in progress.
+    ///
+    /// Releases whatever bluez is waiting on rather than leaving the call
+    /// outstanding until it times out.
+    pub fn cancel_pairing(&self) {
+        self.pairing.abandon();
     }
 
     pub fn connect(&self, address: &str) -> Result<(), BtError> {
@@ -459,6 +530,86 @@ impl Bluetooth {
         }
         self.refresh();
         Ok(())
+    }
+}
+
+/// Register an agent, ask bluez to pair, and mark the result trusted.
+///
+/// Two connections, deliberately. One serves the agent and is held open for the
+/// whole pairing, because an agent dies with the connection that registered it
+/// -- the same way a discovery session does, and for the same reason. The other
+/// makes the `Pair` call, so that waiting on a reply cannot starve the dispatch
+/// of the questions that reply is waiting for.
+///
+/// `Pair` is not given a deadline. zbus imposes none and neither does the bus,
+/// so it waits as long as bluez does, which is what somebody typing six digits
+/// on a keyboard needs. The bounds that do exist are the agent's own answer
+/// timeout and [`Bluetooth::cancel_pairing`], which releases an outstanding
+/// question and lets the call fail rather than leaving it in the air.
+fn run_pairing(shared: &Arc<agent::Shared>, address: &str) -> Result<(), Pairing> {
+    use zbus::blocking::{connection, Proxy};
+
+    let fail = |stage: Stage, reason: String| Pairing::Failed {
+        address: address.to_string(),
+        stage,
+        reason,
+    };
+
+    let device_path = agent::path_for("hci0", address);
+    let agent_path = zbus::zvariant::ObjectPath::try_from(agent::AGENT_PATH)
+        .map_err(|e| fail(Stage::Registering, e.to_string()))?;
+
+    let served = agent::Agent {
+        shared: shared.clone(),
+    };
+    let conn = connection::Builder::system()
+        .and_then(|b| b.serve_at(&agent_path, served))
+        .and_then(|b| b.build())
+        .map_err(|e| fail(Stage::Registering, e.to_string()))?;
+
+    let manager = Proxy::new(&conn, "org.bluez", "/org/bluez", "org.bluez.AgentManager1")
+        .map_err(|e| fail(Stage::Registering, e.to_string()))?;
+    manager
+        .call::<_, _, ()>("RegisterAgent", &(&agent_path, agent::CAPABILITY))
+        .map_err(|e| fail(Stage::Registering, e.to_string()))?;
+    // Being the default agent is what makes bluez route questions here rather
+    // than to whatever else is registered. Not fatal if it is refused: another
+    // agent holding the default still leaves ours registered for our own calls.
+    let _ = manager.call::<_, _, ()>("RequestDefaultAgent", &(&agent_path,));
+
+    let caller = connection::Builder::system()
+        .and_then(|b| b.build())
+        .map_err(|e| fail(Stage::Pairing, e.to_string()))?;
+    let device = Proxy::new(&caller, "org.bluez", device_path.as_str(), "org.bluez.Device1")
+        .map_err(|e| fail(Stage::NoSuchDevice, e.to_string()))?;
+
+    let outcome = device.call::<_, _, ()>("Pair", &());
+    let _ = manager.call::<_, _, ()>("UnregisterAgent", &(&agent_path,));
+
+    match outcome {
+        Ok(()) => {
+            // Trusted, or a keyboard that goes to sleep has to be reconnected by
+            // hand from a panel that has no keyboard.
+            if let Err(e) = device.set_property("Trusted", true) {
+                return Err(fail(Stage::Trusting, e.to_string()));
+            }
+            shared.set(Pairing::Succeeded {
+                address: address.to_string(),
+            });
+            Ok(())
+        }
+        Err(e) => {
+            // bluez's own wording, which says considerably more than ours would:
+            // AuthenticationFailed, AuthenticationCanceled, AlreadyExists and
+            // ConnectionAttemptFailed all mean different things to do next.
+            let text = e.to_string();
+            let stage = if text.contains("does not exist") || text.contains("No such") {
+                Stage::NoSuchDevice
+            } else {
+                Stage::Pairing
+            };
+            Err(fail(stage, text))
+        }
     }
 }
 
