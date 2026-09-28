@@ -15,10 +15,33 @@
 //! metadata. Only the first is useful, and the way to tell them apart is that
 //! the metadata node enumerates no capture formats -- which is why
 //! [`devices`] asks for formats rather than trusting the node's index.
+//!
+//! # Two layers
+//!
+//! The free functions below are the primitives: each one runs a `v4l2-ctl` and
+//! blocks until it answers. They are correct and they are the wrong thing to
+//! call from a UI thread, because "until it answers" is not bounded by anything
+//! a caller controls -- enumerating four nodes is four process spawns and the
+//! device gets a say in how long each takes.
+//!
+//! So [`Video`] wraps them the way [`crate::media`], [`crate::mic`] and
+//! [`crate::preview`] wrap theirs: a worker thread does the talking, callers get
+//! a cheap [`State`] snapshot, and writes are queued rather than performed. That
+//! is the shape every other module in this crate already had, and `video` was
+//! the one that did not -- which is how a slow camera could stall the first
+//! window or freeze a touch.
+//!
+//! A queued write carries the device path it was issued against, and the worker
+//! drops it if the selection has moved on by the time it runs. Applying a
+//! brightness meant for the webcam to the capture card instead would be worse
+//! than doing nothing.
 
 use crate::util::{last_line, read_trim, run};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 const T: Duration = Duration::from_secs(5);
@@ -60,6 +83,293 @@ pub struct Control {
     pub active: bool,
 }
 
+/// Which of the two devices a call is about.
+///
+/// They are addressed by role rather than by path because that is how the panel
+/// thinks about them: one is "the camera", whichever camera that currently is,
+/// and the other is the HDMI input that every unit has.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+pub enum Target {
+    Camera,
+    Capture,
+}
+
+/// Everything read from one device, as of one moment.
+///
+/// `path` is not decoration: it is how a caller confirms that what it is holding
+/// describes the device it thinks is selected, rather than the one that was
+/// selected when the read started.
+#[derive(Clone, Default, Serialize)]
+pub struct Reading {
+    pub path: String,
+    /// What the device is set to right now: fourcc, width, height.
+    pub format: Option<(String, u32, u32)>,
+    /// Which entry of the device's `formats` that corresponds to, if any. V4L2
+    /// can be in a mode it does not advertise, so this really can be None while
+    /// `format` is Some.
+    pub mode: Option<usize>,
+    pub controls: Vec<Control>,
+}
+
+#[derive(Clone, Default, Serialize)]
+pub struct State {
+    /// Capture devices that are NOT the built-in HDMI card, in `/dev/videoN`
+    /// order. Empty on a unit with no webcam, which is two of the three here.
+    pub cameras: Vec<Device>,
+    /// Index into `cameras` of the selected one.
+    pub camera: Option<usize>,
+    /// What was read from the selected camera.
+    pub camera_reading: Reading,
+    /// The built-in HDMI capture card.
+    pub capture: Option<Device>,
+    /// What was read from the capture card.
+    pub capture_reading: Reading,
+    /// Bumped every time a refresh completes. A consumer that rebuilds UI models
+    /// from this should do it when the generation changes and not otherwise:
+    /// rebuilding a model on a timer resets a control under whoever is touching
+    /// it.
+    pub generation: u64,
+    pub error: Option<String>,
+}
+
+enum Job {
+    Refresh,
+    SelectCamera(usize),
+    SetFormat { target: Target, path: String, mode: usize },
+    SetControl { target: Target, path: String, name: String, value: i64 },
+}
+
+struct Inner {
+    state: State,
+    /// The camera the worker is tracking, by path rather than by index: indices
+    /// move when a device is plugged in or out, and a selection that silently
+    /// becomes a different camera is worse than one that is lost.
+    selected: Option<String>,
+}
+
+pub struct Video {
+    inner: Mutex<Inner>,
+    tx: Mutex<Option<Sender<Job>>>,
+}
+
+impl Video {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(Inner { state: State::default(), selected: None }),
+            tx: Mutex::new(None),
+        })
+    }
+
+    /// Returns immediately. The first enumeration happens on the worker, so
+    /// nothing here is on the path to showing the first window.
+    pub fn start(self: &Arc<Self>) {
+        let (tx, rx) = channel();
+        *self.tx.lock().unwrap() = Some(tx);
+        let me = self.clone();
+        thread::Builder::new()
+            .name("hal-video".into())
+            .spawn(move || me.work(rx))
+            .expect("spawn the video thread");
+    }
+
+    pub fn state(&self) -> State {
+        self.inner.lock().unwrap().state.clone()
+    }
+
+    /// Ask for a fresh enumeration. Cheap and non-blocking; the answer turns up
+    /// in [`State`] with a new `generation`.
+    pub fn refresh(&self) {
+        self.send(Job::Refresh);
+    }
+
+    pub fn select_camera(&self, index: usize) {
+        self.send(Job::SelectCamera(index));
+    }
+
+    /// Ask the device for one of the modes in its `formats`.
+    ///
+    /// The path is stamped here, on the caller's thread, from the selection as
+    /// it stands right now. That is what lets the worker tell a write meant for
+    /// this device from one meant for whatever was selected a moment ago.
+    pub fn set_format(&self, target: Target, mode: usize) {
+        let Some(path) = self.path_of(target) else { return };
+        self.send(Job::SetFormat { target, path, mode });
+    }
+
+    pub fn set_control(&self, target: Target, name: &str, value: i64) {
+        let Some(path) = self.path_of(target) else { return };
+        self.send(Job::SetControl { target, path, name: name.to_string(), value });
+    }
+
+    fn send(&self, job: Job) {
+        if let Some(tx) = self.tx.lock().unwrap().as_ref() {
+            // A closed channel means the worker is gone, which on this panel
+            // means the process is going down. Nothing useful to say about it.
+            let _ = tx.send(job);
+        }
+    }
+
+    fn path_of(&self, target: Target) -> Option<String> {
+        let inner = self.inner.lock().unwrap();
+        let reading = match target {
+            Target::Camera => &inner.state.camera_reading,
+            Target::Capture => &inner.state.capture_reading,
+        };
+        (!reading.path.is_empty()).then(|| reading.path.clone())
+    }
+
+    fn work(self: Arc<Self>, rx: Receiver<Job>) {
+        // Before waiting for anything to ask: the panel wants a device list as
+        // soon as there is one, and this is off the UI thread now.
+        self.enumerate();
+        while let Ok(job) = rx.recv() {
+            match job {
+                Job::Refresh => self.enumerate(),
+                Job::SelectCamera(index) => {
+                    {
+                        let mut inner = self.inner.lock().unwrap();
+                        let path = inner.state.cameras.get(index).map(|c| c.path.clone());
+                        if path.is_none() {
+                            continue;
+                        }
+                        inner.selected = path;
+                    }
+                    self.enumerate();
+                }
+                Job::SetFormat { target, path, mode } => {
+                    if !self.still_selected(target, &path) {
+                        continue;
+                    }
+                    let fmt = self.format_at(target, mode);
+                    if let Some(f) = fmt {
+                        if let Err(e) = set_format(&path, &f.fourcc, f.width, f.height) {
+                            eprintln!("hub-hal: {path} format: {e}");
+                        }
+                    }
+                    self.reread(target, &path);
+                }
+                Job::SetControl { target, path, name, value } => {
+                    if !self.still_selected(target, &path) {
+                        continue;
+                    }
+                    if let Err(e) = set_control(&path, &name, value) {
+                        eprintln!("hub-hal: {path} {name}: {e}");
+                    }
+                    self.reread(target, &path);
+                }
+            }
+        }
+    }
+
+    /// Whether the device a queued write was issued against is still the one
+    /// that role points at.
+    fn still_selected(&self, target: Target, path: &str) -> bool {
+        self.path_of(target).as_deref() == Some(path)
+    }
+
+    fn format_at(&self, target: Target, mode: usize) -> Option<Format> {
+        let inner = self.inner.lock().unwrap();
+        let device = match target {
+            Target::Camera => inner.state.camera.and_then(|i| inner.state.cameras.get(i)),
+            Target::Capture => inner.state.capture.as_ref(),
+        }?;
+        device.formats.get(mode).cloned()
+    }
+
+    /// Re-read one device after writing to it.
+    ///
+    /// The whole set of controls, not the one that was written: V4L2 controls own
+    /// each other, so turning autofocus on makes focus_absolute inactive and the
+    /// UI has to follow. The format is re-read for the same reason in reverse --
+    /// V4L2 answers a set-format request with something it can do, which is not
+    /// always what was asked for.
+    fn reread(&self, target: Target, path: &str) {
+        let formats = {
+            let inner = self.inner.lock().unwrap();
+            match target {
+                Target::Camera => inner
+                    .state
+                    .camera
+                    .and_then(|i| inner.state.cameras.get(i))
+                    .map(|d| d.formats.clone()),
+                Target::Capture => inner.state.capture.as_ref().map(|d| d.formats.clone()),
+            }
+        };
+        let Some(formats) = formats else { return };
+        let reading = read_device(path, &formats);
+
+        let mut inner = self.inner.lock().unwrap();
+        // Selection can have moved while the reads were running. Publishing this
+        // would describe one device under another's name.
+        let current = match target {
+            Target::Camera => &inner.state.camera_reading,
+            Target::Capture => &inner.state.capture_reading,
+        };
+        if current.path != path {
+            return;
+        }
+        match target {
+            Target::Camera => inner.state.camera_reading = reading,
+            Target::Capture => inner.state.capture_reading = reading,
+        }
+        inner.state.generation += 1;
+    }
+
+    /// One full pass: what is plugged in, and everything about the two devices
+    /// that matter.
+    fn enumerate(&self) {
+        let all = devices();
+        let (capture, cameras): (Vec<Device>, Vec<Device>) =
+            all.into_iter().partition(|d| d.is_capture_card);
+        let capture = capture.into_iter().next();
+
+        // Keep the selection across a re-enumeration where the device is still
+        // there. Fall back to the first camera rather than to nothing, so a unit
+        // with exactly one webcam never needs anyone to pick it.
+        let wanted = self.inner.lock().unwrap().selected.clone();
+        let index = wanted
+            .as_deref()
+            .and_then(|p| cameras.iter().position(|c| c.path == p))
+            .or_else(|| (!cameras.is_empty()).then_some(0));
+
+        let camera_reading = match index.and_then(|i| cameras.get(i)) {
+            Some(c) => read_device(&c.path, &c.formats),
+            None => Reading::default(),
+        };
+        let capture_reading = match &capture {
+            Some(c) => read_device(&c.path, &c.formats),
+            None => Reading::default(),
+        };
+
+        let mut inner = self.inner.lock().unwrap();
+        inner.selected = index.and_then(|i| cameras.get(i)).map(|c| c.path.clone());
+        inner.state.cameras = cameras;
+        inner.state.camera = index;
+        inner.state.camera_reading = camera_reading;
+        inner.state.capture = capture;
+        inner.state.capture_reading = capture_reading;
+        inner.state.generation += 1;
+        inner.state.error = None;
+    }
+}
+
+fn read_device(path: &str, formats: &[Format]) -> Reading {
+    let format = current_format(path);
+    let mode = format.as_ref().and_then(|f| mode_index(formats, f));
+    Reading { path: path.to_string(), format, mode, controls: controls(path) }
+}
+
+/// Which entry of `formats` a current format corresponds to.
+///
+/// Matched on size and fourcc rather than assumed to be the first: V4L2 answers
+/// a set-format request with something it can do, which is not always what was
+/// asked for, and a picker showing a mode the device is not in would be a lie.
+pub fn mode_index(formats: &[Format], current: &(String, u32, u32)) -> Option<usize> {
+    let (fourcc, w, h) = current;
+    formats
+        .iter()
+        .position(|f| f.width == *w && f.height == *h && f.fourcc == *fourcc)
+}
 /// Every node that can actually deliver frames, in `/dev/videoN` order.
 pub fn devices() -> Vec<Device> {
     let mut nodes: Vec<PathBuf> = std::fs::read_dir("/sys/class/video4linux")
@@ -253,5 +563,52 @@ pub fn set_control(path: &str, name: &str, value: i64) -> Result<(), String> {
         Ok(())
     } else {
         Err(last_line(&out.text))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fmt(fourcc: &str, width: u32, height: u32) -> Format {
+        Format { fourcc: fourcc.into(), width, height, fps: vec![] }
+    }
+
+    /// The picker shows a mode only if the device is really in it. A device in a
+    /// size it does not advertise has to come back as None rather than as the
+    /// first entry, which would put a tick next to a mode nothing is using.
+    #[test]
+    fn mode_index_matches_size_and_fourcc() {
+        let formats = [fmt("MJPG", 1920, 1080), fmt("YUYV", 1920, 1080), fmt("MJPG", 1280, 720)];
+        assert_eq!(mode_index(&formats, &("YUYV".into(), 1920, 1080)), Some(1));
+        assert_eq!(mode_index(&formats, &("MJPG".into(), 1280, 720)), Some(2));
+        // Right size, format the device does not list here.
+        assert_eq!(mode_index(&formats, &("NV12".into(), 1920, 1080)), None);
+        // Right format, size it does not list.
+        assert_eq!(mode_index(&formats, &("MJPG".into(), 640, 480)), None);
+    }
+
+    /// Controls own each other, and the flag saying so has to survive parsing --
+    /// an inactive control accepts writes and ignores them, so drawing it as live
+    /// would be a lie.
+    #[test]
+    fn parses_an_inactive_control() {
+        let line = "     exposure_time_absolute 0x009a0902 (int)    : min=1 max=2500 step=1 default=330 value=330 flags=inactive";
+        let c = parse_control(line).expect("a control");
+        assert_eq!(c.name, "exposure_time_absolute");
+        assert_eq!(c.kind, "int");
+        assert_eq!((c.min, c.max, c.value), (1, 2500, 330));
+        assert!(!c.active);
+    }
+
+    /// bool controls list no min or max. Leaving the range at 0..0 would give a
+    /// switch nothing to be.
+    #[test]
+    fn bool_controls_get_a_range() {
+        let line = "        white_balance_automatic 0x0098090c (bool)   : default=1 value=1";
+        let c = parse_control(line).expect("a control");
+        assert_eq!(c.kind, "bool");
+        assert_eq!((c.min, c.max), (0, 1));
+        assert!(c.active);
     }
 }

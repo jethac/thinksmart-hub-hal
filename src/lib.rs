@@ -18,7 +18,8 @@
 //!   source is not always the microphone -- on most of these units WirePlumber
 //!   had picked the HDMI capture card instead.
 //! - [`video`] Capture devices through V4L2: the built-in HDMI card, and a USB
-//!   webcam where one is fitted.
+//!   webcam where one is fitted. Enumeration and writes go through a worker, so
+//!   a slow camera cannot stall whoever asked.
 //! - [`preview`] Live frames from one of those, for a preview pane. YUYV and
 //!   MJPEG, because the two devices here each offer only one of them.
 //! - [`hid`] Read-only raw HID capture, for the undocumented devices.
