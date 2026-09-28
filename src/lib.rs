@@ -14,6 +14,11 @@
 //! - [`audio`] Speaker output. Hardware volume does nothing -- a Harman DSP
 //!   ignores it -- so PipeWire software volume is the only control.
 //! - [`mic`] The microphone array.
+//! - [`media`] Which audio devices exist and which one is in use. The default
+//!   source is not always the microphone -- on most of these units WirePlumber
+//!   had picked the HDMI capture card instead.
+//! - [`video`] Capture devices through V4L2: the built-in HDMI card, and a USB
+//!   webcam where one is fitted.
 //! - [`hid`] Read-only raw HID capture, for the undocumented devices.
 //! - [`inventory`] A one-shot description of the hardware.
 //! - [`util`] Process and file helpers every backend shares, including the
@@ -28,6 +33,8 @@ pub mod display;
 pub mod hid;
 pub mod inventory;
 pub mod led;
+pub mod media;
 pub mod mic;
 pub mod prox;
+pub mod video;
 pub mod util;
