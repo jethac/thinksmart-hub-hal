@@ -3,16 +3,14 @@
 Hardware support for the **Lenovo ThinkSmart Hub 500** running Debian 13. One
 Rust crate, one module per piece of hardware, no UI and no policy.
 
-Extracted from [jethac/thinksmart-hub-tester](https://github.com/jethac/thinksmart-hub-tester)
-so that every app on this panel shares one implementation of the quirks instead
-of rediscovering them. **The quirks are the reason this crate exists.** The
+Extracted from a test harness for the same machine so that every app on this
+panel shares one implementation of the quirks instead of rediscovering them. **The quirks are the reason this crate exists.** The
 hardware has several failure modes that are not obvious, and two of them can
 hang a task in the kernel that no signal will clear.
 
-Hardware facts and their provenance live in
-[jethac/thinksmart-hub-custom](https://github.com/jethac/thinksmart-hub-custom)
-(`docs/hardware.md`, `docs/peripherals.md`, `docs/verified.md`). That repo
-records what the hardware does; this one turns it into code.
+Every hardware fact below was measured on these units rather than taken from a
+datasheet, because there is no datasheet. Where a number appears — a timing, an
+entrypoint count, a USB id — it came off one of these machines.
 
 ## Modules
 
@@ -64,11 +62,11 @@ decode   MPEG-2, H.264 Main/High/ConstrainedBaseline, JPEG Baseline,
 encode   H.264 (EncSlice and the low-power EncSliceLP), JPEG
 ```
 
-**There is no VP8 or VP9 encode.** Decode for both, encode for neither. WebRTC
-commonly negotiates VP8 outbound, and if it does, this box software-encodes on
-four 2.7 GHz cores while the H.264 encoder sits idle. Pin outbound video to
-H.264, and assert it rather than hoping — a silent fallback presents as "calls
-run a bit hot" rather than as a misconfiguration.
+**There is no VP8 or VP9 encode.** Decode for both, encode for neither. Anything
+that encodes video here has to be told to use H.264, and told explicitly: a
+stack that negotiates VP8 will fall back to encoding on four 2.7 GHz cores while
+the hardware encoder sits idle, and the symptom is a machine that runs hot
+rather than an error anybody can act on.
 
 ### The driver trap
 
@@ -94,8 +92,9 @@ frames, alternating — so the run-to-run spread is wider than the gap. This cra
 now tries iHD first because i965 is frozen upstream at 2.4.1, and keeps i965 as
 the fallback.
 
-`LIBVA_DRIVER_NAME` is set **per child process**, never system-wide: a browser
-encoding a call may want a different driver from the one decoding a preview.
+`LIBVA_DRIVER_NAME` is set **per child process**, never system-wide. Two
+consumers on the same machine can want different drivers, and choosing one for
+the whole system chooses it for all of them.
 
 ## Things this hardware will do to you
 
@@ -104,7 +103,7 @@ A list for anyone else who has bought one of these.
 - **The PIR sensor can hang a task nothing can kill.** See above. This is the
   one that actually costs you a reboot.
 - **`pgrep` will not find a process named 15+ characters.** The kernel truncates
-  `comm`; `straylight-panel` appears as `straylight-pane`. `ps -C` and
+  `comm` to 15, so a sixteen-character binary name is never found. `ps -C` and
   `pgrep -f` work. It fails silently and confidently.
 - **The Wayland socket has a `.lock` beside it.** Picking `wayland-0.lock` gives
   you a `WAYLAND_DISPLAY` that looks entirely plausible and connects to nothing.
@@ -126,10 +125,10 @@ It is not published. Depend on it by git:
 
 ```toml
 [dependencies]
-hub-hal = { git = "ssh://git@github.com/jethac/thinksmart-hub-hal.git", tag = "v0.1.0" }
+hub-hal = { git = "https://github.com/jethac/thinksmart-hub-hal.git", tag = "v0.9.0" }
 ```
 
-Pin a tag rather than tracking `master`, so a panel app does not change hardware
+Pin a tag rather than tracking `master`, so an app does not change hardware
 behaviour underneath itself on an unrelated push.
 
 ## Build
@@ -143,10 +142,35 @@ Depends only on glibc at runtime, so building on an older distribution than the
 Hub's Debian 13 is fine — which is what `thinksmart-fleet` does, building on the
 control node and shipping the binary.
 
-## Consumers
+## Who this is for
 
-- [thinksmart-hub-tester](https://github.com/jethac/thinksmart-hub-tester) —
-  exercises every piece of this hardware from a touch page, so a unit can be
-  checked off before anything is built on it.
-- [thinksmart-hub-home](https://github.com/jethac/thinksmart-hub-home) — the
-  home panel app.
+Anyone else who has one of these.
+
+The ThinkSmart Hub 500 was a Microsoft Teams Rooms appliance, which means a lot
+of them are now on the secondhand market for very little: an i5-7500T, 11.6" of
+1920x1080 touchscreen at roughly 190 PPI, a microphone array, a speakerphone, an
+HDMI capture input and an LED ring, in one unit designed to sit on a desk and be
+left on. It runs Debian perfectly well once you know where the bodies are
+buried.
+
+Knowing where they are buried is the whole value here. Most of this hardware
+does not work the way its interfaces suggest: there is no backlight class, the
+speaker ignores hardware volume, the proximity sensor can hang a task nothing
+can kill, and the GPU driver that sounds newer is the one that cannot scale. None
+of that is documented anywhere, and all of it was found by losing time to it.
+
+So this crate is published in the hope that the next person to buy one does not
+have to lose the same time. It is deliberately **only hardware** — no UI, no
+policy, no opinion about what you build on top — so it should be usable whatever
+you have in mind for yours.
+
+It is not a general-purpose library and makes no attempt to be. It targets one
+machine on Debian 13, it shells out to `ddcutil`, `v4l2-ctl`, `wpctl`, `vainfo`,
+`ffmpeg` and `grim` rather than linking anything, and it will not build you a
+cross-platform abstraction. On this hardware, a child process with a deadline is
+the only thing that survives a driver that stops answering, and that shapes
+everything else.
+
+## License
+
+MIT or Apache-2.0, at your option.
