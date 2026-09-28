@@ -14,18 +14,97 @@ pub struct Output {
     pub text: String,
 }
 
+/// Why a command did not produce an answer.
+///
+/// Separate variants because the three have different fixes and a caller that
+/// only sees a string has to guess which one it is looking at. A missing binary
+/// is a packaging problem, a timeout is a wedged device or compositor, and a
+/// non-zero exit is the command telling you something.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RunError {
+    /// The binary is not on PATH. Install it.
+    NotFound(String),
+    /// Spawning failed for some other reason -- permissions, usually.
+    Spawn(String),
+    /// It ran and did not finish in time. It has been killed.
+    Timeout(Duration),
+    /// It ran and exited non-zero. The text is the last line it wrote.
+    Failed(String),
+}
+
+impl std::fmt::Display for RunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RunError::NotFound(c) => write!(f, "{c} is not installed"),
+            RunError::Spawn(e) => write!(f, "could not start: {e}"),
+            RunError::Timeout(d) => write!(f, "no answer in {}s", d.as_secs()),
+            RunError::Failed(t) => write!(f, "{t}"),
+        }
+    }
+}
+
+/// What actually happened, before it is flattened into one of the two public
+/// shapes below. Both `run` and `run_env` are built on this so the pipe-draining
+/// and deadline logic exists once -- that is the part worth not duplicating.
+enum Exec {
+    Ran { ok: bool, text: String },
+    NotFound(String),
+    Spawn(String),
+    Timeout,
+}
+
 /// Run a command with a hard deadline. Never panics; a missing binary or a
 /// timeout comes back as `ok: false` with the reason in `text`.
 pub fn run(cmd: &str, args: &[&str], timeout: Duration) -> Output {
-    let mut child = match Command::new(cmd)
+    match exec(cmd, args, &[], timeout) {
+        Exec::Ran { ok, text } => Output { ok, text },
+        // Kept in the original `{cmd}: {e}` shape: several modules parse or log
+        // this text, and this function has no business changing what they see.
+        Exec::NotFound(e) | Exec::Spawn(e) => Output { ok: false, text: format!("{cmd}: {e}") },
+        Exec::Timeout => Output {
+            ok: false,
+            text: format!("{cmd}: no answer in {}s", timeout.as_secs()),
+        },
+    }
+}
+
+/// Run a command with a deadline and extra environment, and say precisely how it
+/// failed.
+///
+/// The environment is why this exists: a Wayland client needs XDG_RUNTIME_DIR and
+/// WAYLAND_DISPLAY, and this crate is used from processes that have neither --
+/// an Ansible-driven shell, a systemd unit, a test. `run` cannot express that,
+/// and a caller that shells out itself loses the deadline, which is the one thing
+/// every external command in this crate is required to have.
+pub fn run_env(
+    cmd: &str,
+    args: &[&str],
+    env: &[(&str, &str)],
+    timeout: Duration,
+) -> Result<String, RunError> {
+    match exec(cmd, args, env, timeout) {
+        Exec::Ran { ok: true, text } => Ok(text),
+        Exec::Ran { ok: false, text } => Err(RunError::Failed(last_line(&text))),
+        Exec::NotFound(_) => Err(RunError::NotFound(cmd.to_string())),
+        Exec::Spawn(e) => Err(RunError::Spawn(e)),
+        Exec::Timeout => Err(RunError::Timeout(timeout)),
+    }
+}
+
+fn exec(cmd: &str, args: &[&str], env: &[(&str, &str)], timeout: Duration) -> Exec {
+    let mut command = Command::new(cmd);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+    for (k, v) in env {
+        command.env(k, v);
+    }
+    let mut child = match command.spawn() {
         Ok(c) => c,
-        Err(e) => return Output { ok: false, text: format!("{cmd}: {e}") },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Exec::NotFound(e.to_string()),
+        Err(e) => return Exec::Spawn(e.to_string()),
     };
 
     // Drain both pipes on their own threads. Waiting first and reading after
@@ -59,11 +138,8 @@ pub fn run(cmd: &str, args: &[&str], timeout: Duration) -> Output {
 
     let text = out.join().unwrap_or_default() + &err.join().unwrap_or_default();
     match status {
-        Some(st) => Output { ok: st.success(), text },
-        None => Output {
-            ok: false,
-            text: format!("{cmd}: no answer in {}s", timeout.as_secs()),
-        },
+        Some(st) => Exec::Ran { ok: st.success(), text },
+        None => Exec::Timeout,
     }
 }
 

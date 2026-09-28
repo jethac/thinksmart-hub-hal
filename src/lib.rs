@@ -5,8 +5,13 @@
 //! rather than rediscovering them. The quirks are the point: this hardware has
 //! several failure modes that are not obvious and are expensive to relearn.
 //!
-//! - [`display`] Panel brightness and power over DDC/CI. There is no
-//!   `/sys/class/backlight`; the bus number is not fixed and must be discovered.
+//! - [`display`] The panel. Brightness and power over DDC/CI -- there is no
+//!   `/sys/class/backlight` and the bus number is not fixed, so it is discovered
+//!   -- and the mode the kernel has it in, for an app that wants to check it is
+//!   using the whole screen.
+//! - [`screen`] A screenshot of what the compositor is showing. The panel is on a
+//!   wall with no keyboard, so this is the only way to see it; the hardware being
+//!   right while the compositor is wrong is a real failure mode here.
 //! - [`prox`] The PIR sensor. Reads are HID round trips that sometimes never
 //!   answer, leaving a task in uninterruptible sleep that cannot be killed. Every
 //!   access here is a child process with a deadline for exactly that reason.
@@ -40,5 +45,6 @@ pub mod media;
 pub mod mic;
 pub mod preview;
 pub mod prox;
+pub mod screen;
 pub mod video;
 pub mod util;

@@ -1,10 +1,15 @@
-//! Panel brightness and power over DDC/CI.
+//! The panel: brightness and power over DDC/CI, and what mode it is in.
 //!
 //! There is no /sys/class/backlight on the Hub 500. The panel answers DDC/CI on
 //! an I2C bus (i2c-5 on the reference unit): VCP 0x10 is brightness 0-100 and
 //! VCP 0xD6 is power mode. ddcutil takes ~200 ms per call and the bus does not
 //! like being hammered, so state is cached and refreshed slowly, and every call
 //! is serialised through one lock.
+//!
+//! [`panel`] and [`Panel::shortfall`] are a different thing entirely and are here
+//! because they answer a question about the same piece of hardware: how big is it
+//! actually. They read /sys/class/drm rather than asking a compositor, because
+//! the compositor is frequently the thing that is wrong.
 
 use crate::util::{last_line, now_ms, run};
 use serde::Serialize;
@@ -167,6 +172,154 @@ impl Display {
     }
 }
 
+/// A connected display, as the kernel sees it.
+///
+/// Read from /sys/class/drm, which is the mode the hardware is in -- not what a
+/// compositor believes, and not what a toolkit has been told. That distinction is
+/// the entire reason this exists.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct Panel {
+    /// DRM connector, e.g. `card0-DP-1`.
+    pub connector: String,
+    /// The preferred mode, which on a fixed panel is its native resolution.
+    pub width: u32,
+    pub height: u32,
+    /// The Hub 500's own screen rather than something plugged into an HDMI port.
+    pub internal: bool,
+    /// DPMS says the connector is on. A blanked panel still reports its mode.
+    pub powered: bool,
+}
+
+/// How far a window falls short of covering the panel.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Shortfall {
+    pub connector: String,
+    pub panel_width: u32,
+    pub panel_height: u32,
+    pub window_width: u32,
+    pub window_height: u32,
+    /// Unused pixels along each edge. Either can be zero.
+    pub unused_width: u32,
+    pub unused_height: u32,
+}
+
+impl std::fmt::Display for Shortfall {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "window is {}x{} on {} which is {}x{}: {} px unused across, {} px unused down",
+            self.window_width,
+            self.window_height,
+            self.connector,
+            self.panel_width,
+            self.panel_height,
+            self.unused_width,
+            self.unused_height
+        )
+    }
+}
+
+impl Panel {
+    /// Whether a window of this physical size covers the whole panel.
+    pub fn covers(&self, window_width: u32, window_height: u32) -> bool {
+        window_width >= self.width && window_height >= self.height
+    }
+
+    /// What is missing, or None when the window covers the panel.
+    ///
+    /// This is the check that was not there. The panel spent a day running
+    /// 1920x1045 inside a 1920x1080 display -- a compositor was letting the
+    /// client draw its own decorations, so 35 rows were reserved and never
+    /// painted. It was invisible in every log, and was found by taking a
+    /// screenshot and counting black rows. Nothing in software could have
+    /// noticed, because nothing in software had ever compared the two numbers.
+    ///
+    /// Sizes are PHYSICAL pixels. A toolkit working in logical pixels has to
+    /// multiply by its scale factor before asking, or this will report a
+    /// shortfall on a correct window.
+    pub fn shortfall(&self, window_width: u32, window_height: u32) -> Option<Shortfall> {
+        if self.covers(window_width, window_height) {
+            return None;
+        }
+        Some(Shortfall {
+            connector: self.connector.clone(),
+            panel_width: self.width,
+            panel_height: self.height,
+            window_width,
+            window_height,
+            unused_width: self.width.saturating_sub(window_width),
+            unused_height: self.height.saturating_sub(window_height),
+        })
+    }
+}
+
+/// Every connected display, in connector order.
+pub fn panels() -> Vec<Panel> {
+    let Ok(dir) = std::fs::read_dir("/sys/class/drm") else {
+        return Vec::new();
+    };
+    let mut found: Vec<Panel> = dir
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let path = e.path();
+            let name = path.file_name()?.to_str()?.to_string();
+            // card0-DP-1 and friends. Bare `card0` is the device, not a
+            // connector, and has no status to read.
+            if !name.contains('-') {
+                return None;
+            }
+            if crate::util::read_trim(path.join("status"))? != "connected" {
+                return None;
+            }
+            let (width, height) = parse_modes(&crate::util::read_trim(path.join("modes"))?)?;
+            Some(Panel {
+                internal: is_internal(&name),
+                connector: name,
+                width,
+                height,
+                powered: crate::util::read_trim(path.join("dpms"))
+                    .map(|d| d.eq_ignore_ascii_case("On"))
+                    .unwrap_or(false),
+            })
+        })
+        .collect();
+    found.sort_by(|a, b| a.connector.cmp(&b.connector));
+    found
+}
+
+/// The Hub 500's own screen.
+///
+/// The internal one if it is there, otherwise whatever single display is
+/// connected -- a unit on a bench with an HDMI monitor should still be able to
+/// answer this rather than returning nothing and looking broken.
+pub fn panel() -> Option<Panel> {
+    let all = panels();
+    all.iter()
+        .find(|p| p.internal)
+        .cloned()
+        .or_else(|| (all.len() == 1).then(|| all[0].clone()))
+}
+
+/// The first line of `modes` is the preferred mode, which on a fixed panel is its
+/// native resolution. Later lines are fallbacks the panel will also accept and
+/// are not what it is running.
+fn parse_modes(text: &str) -> Option<(u32, u32)> {
+    let first = text.lines().next()?.trim();
+    let (w, h) = first.split_once('x')?;
+    // Modes can carry a suffix like `1920x1080i` for interlaced.
+    let h: String = h.chars().take_while(|c| c.is_ascii_digit()).collect();
+    Some((w.trim().parse().ok()?, h.parse().ok()?))
+}
+
+/// The Hub 500 drives its own screen over embedded DisplayPort; the two HDMI
+/// connectors are outputs for external monitors. Same rule as [`pick_panel`]
+/// applies to ddcutil output, kept separate because one reads sysfs and the other
+/// parses a tool.
+fn is_internal(connector: &str) -> bool {
+    let c = connector.to_ascii_uppercase();
+    c.contains("-DP-") || c.contains("EDP")
+}
+
 /// Choose the internal panel from `ddcutil detect` output. It is on embedded
 /// DisplayPort (card0-DP-1); the two HDMI outputs are external monitors, which
 /// may also speak DDC/CI and must not be mistaken for the panel.
@@ -229,6 +382,55 @@ mod tests {
         let text = "Display 1\n   I2C bus:  /dev/i2c-3\n   DRM connector:  card0-HDMI-A-1\n\
                     Display 2\n   I2C bus:  /dev/i2c-5\n   DRM connector:  card0-DP-1\n";
         assert_eq!(pick_panel(text), (Some(5), Some("card0-DP-1".into())));
+    }
+
+    #[test]
+    fn reads_the_preferred_mode_and_ignores_the_fallbacks() {
+        // What /sys/class/drm/card0-DP-1/modes looks like on a hub: the native
+        // mode twice, because the panel advertises it under two timings.
+        assert_eq!(parse_modes("1920x1080\n1920x1080\n"), Some((1920, 1080)));
+        assert_eq!(parse_modes("1920x1080i\n1280x720\n"), Some((1920, 1080)));
+        assert_eq!(parse_modes(""), None);
+        assert_eq!(parse_modes("garbage\n"), None);
+    }
+
+    #[test]
+    fn tells_the_built_in_screen_from_an_hdmi_port() {
+        assert!(is_internal("card0-DP-1"));
+        assert!(is_internal("card0-eDP-1"));
+        assert!(!is_internal("card0-HDMI-A-1"));
+        assert!(!is_internal("card0-HDMI-A-2"));
+    }
+
+    #[test]
+    fn a_window_that_covers_the_panel_reports_nothing() {
+        let p = Panel {
+            connector: "card0-DP-1".into(),
+            width: 1920,
+            height: 1080,
+            internal: true,
+            powered: true,
+        };
+        assert!(p.covers(1920, 1080));
+        assert_eq!(p.shortfall(1920, 1080), None);
+    }
+
+    #[test]
+    fn the_band_that_was_actually_there_is_reported() {
+        // The real numbers from the day this was added: cage was started without
+        // -d, winit drew its own decorations, and 35 rows were reserved and never
+        // painted.
+        let p = Panel {
+            connector: "card0-DP-1".into(),
+            width: 1920,
+            height: 1080,
+            internal: true,
+            powered: true,
+        };
+        let s = p.shortfall(1920, 1045).expect("a shortfall");
+        assert_eq!(s.unused_height, 35);
+        assert_eq!(s.unused_width, 0);
+        assert!(s.to_string().contains("35 px unused down"), "{s}");
     }
 
     #[test]
