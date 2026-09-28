@@ -43,7 +43,7 @@ const VAINFO_TIMEOUT: Duration = Duration::from_secs(10);
 /// is what lets this work from an Ansible shell, a systemd unit or a test --
 /// none of which have a Wayland socket. `vainfo` with no arguments fails in all
 /// three with "XDG_RUNTIME_DIR is invalid or not set".
-const RENDER_NODE: &str = "/dev/dri/renderD128";
+pub(crate) const RENDER_NODE: &str = "/dev/dri/renderD128";
 
 /// A video codec, as something to ask a question about rather than a string to
 /// match. Only the ones this silicon has an opinion on.
@@ -147,6 +147,28 @@ impl Capabilities {
         self.supports(codec, |e| e.contains("Enc"))
     }
 
+    /// Whether this GPU can scale and convert on the video post-processing
+    /// engine, rather than only decode.
+    ///
+    /// This is the question that decides whether hardware decode is worth
+    /// anything at all here, and it is separate from decoding. Without VPP a
+    /// decoded frame has to be pulled back out of GPU memory at full size --
+    /// 3.1 MB for 1080p NV12 -- and scaled on the CPU, and the download costs
+    /// almost exactly what the decode saved. Measured on this fleet: software
+    /// 3.19 s of CPU for 120 frames, hardware decode without VPP 3.24 s. A wash.
+    ///
+    /// With VPP the scale happens before the download and only 345 KB comes
+    /// back, which is 0.93 s for the same 120 frames.
+    ///
+    /// It is reported as `VAProfileNone : VAEntrypointVideoProc`, which is not a
+    /// codec and so does not fit `can_decode`.
+    pub fn can_post_process(&self) -> bool {
+        self.profiles
+            .iter()
+            .filter(|p| p.name.contains("VAProfileNone"))
+            .any(|p| p.entrypoints.iter().any(|e| e.contains("VideoProc")))
+    }
+
     fn supports(&self, codec: Codec, want: impl Fn(&str) -> bool) -> bool {
         self.profiles
             .iter()
@@ -174,6 +196,54 @@ const ALL: [Codec; 7] = [
     Codec::Jpeg,
 ];
 
+/// Drivers to try, in order of preference, when looking for one that can do a
+/// whole hardware path rather than half of one.
+///
+/// The order is not arbitrary and is the opposite of what the modern advice
+/// would be. On this hardware -- Kaby Lake, Debian 13 -- the maintained iHD
+/// driver reports 15 entrypoints and **no** `VAEntrypointVideoProc`, while the
+/// legacy i965 driver reports 28 and has it. Without VPP the hardware path is
+/// worth nothing (see [`Capabilities::can_post_process`]), so the old driver is
+/// the one that works and is tried first.
+///
+/// An empty name means "whatever libva picks by itself", tried last so that a
+/// unit with neither of the named drivers still gets an answer.
+const DRIVER_CANDIDATES: [&str; 3] = ["i965", "iHD", ""];
+
+/// A hardware path that actually works: a driver that can both decode the codec
+/// and post-process, which is the pair that makes acceleration worth using.
+#[derive(Debug, Clone)]
+pub struct Accelerator {
+    /// What to put in `LIBVA_DRIVER_NAME` for the child doing the decoding.
+    ///
+    /// Set per child rather than for the whole system on purpose: a browser doing
+    /// its own encoding later may well prefer iHD, and choosing a driver for one
+    /// consumer must not choose it for every other.
+    pub driver_name: String,
+    pub caps: Capabilities,
+}
+
+/// The driver to use to hardware-decode `codec`, if any can.
+///
+/// Requires post-processing as well as decode. A driver that can only decode is
+/// reported as no accelerator at all, because using it is measurably not worth
+/// the complexity -- the caller should stay on its software path rather than
+/// take on a second one for nothing.
+pub fn accelerator_for(codec: Codec) -> Option<&'static Accelerator> {
+    static CACHE: OnceLock<Option<Accelerator>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            for name in DRIVER_CANDIDATES {
+                let Ok(caps) = probe_with(name) else { continue };
+                if caps.can_decode(codec) && caps.can_post_process() {
+                    return Some(Accelerator { driver_name: name.to_string(), caps });
+                }
+            }
+            None
+        })
+        .as_ref()
+}
+
 /// What this GPU can do, asked once.
 ///
 /// Cached for the life of the process: it cannot change without the driver being
@@ -187,13 +257,23 @@ pub fn capabilities() -> Result<&'static Capabilities, VaError> {
 }
 
 fn probe() -> Result<Capabilities, VaError> {
+    probe_with("")
+}
+
+/// Ask a named driver what it can do. An empty name lets libva choose.
+fn probe_with(driver: &str) -> Result<Capabilities, VaError> {
     if !Path::new(RENDER_NODE).exists() {
         return Err(VaError::NoRenderNode(RENDER_NODE.to_string()));
     }
+    let env: Vec<(&str, &str)> = if driver.is_empty() {
+        Vec::new()
+    } else {
+        vec![("LIBVA_DRIVER_NAME", driver)]
+    };
     let text = run_env(
         "vainfo",
         &["--display", "drm", "--device", RENDER_NODE],
-        &[],
+        &env,
         VAINFO_TIMEOUT,
     )
     .map_err(|e| match e {

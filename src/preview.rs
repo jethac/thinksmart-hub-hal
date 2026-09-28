@@ -16,6 +16,14 @@
 //! costs one read per output pixel rather than two million conversions. MJPEG has
 //! to be decoded whole before it can be scaled.
 //!
+//! MJPEG is decoded on the GPU where the hardware allows it, by handing the whole
+//! job to an `ffmpeg` child instead of `v4l2-ctl` -- decode, scale and colour
+//! conversion all happen before anything is copied back to system memory. That is
+//! worth 3.4x the CPU at full rate, and the reason it is worth anything at all is
+//! the scaling: see [`crate::vaapi::Capabilities::can_post_process`]. Where the
+//! hardware cannot, the software path below is used unchanged, chosen at runtime
+//! so a unit with a missing or broken driver still shows a picture.
+//!
 //! Like [`crate::mic`], this runs only while something keeps asking. A wall panel
 //! must not hold a camera open because someone once opened a settings page.
 
@@ -178,6 +186,170 @@ impl Preview {
         }
     }
 
+    /// Start the watchdog that can stop a wedged child.
+    ///
+    /// The reader below blocks, and a device with no signal never unblocks it, so
+    /// the decision to give up has to be made on another thread -- killing the
+    /// child is what makes that read return. Shared by both streaming paths
+    /// because the hazard is the same one either way: the process differs, the
+    /// kernel read that will not come back does not.
+    fn watch(self: &Arc<Self>, pid: i32, target: &Target) -> Arc<std::sync::atomic::AtomicBool> {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let done = stop.clone();
+        let me = self.clone();
+        let path = target.path.clone();
+        let generation = target.generation;
+        // Kills by pid because the supervisor owns the only Child handle, and
+        // sharing that through a mutex the reader also wants would be a worse
+        // trade than a pid.
+        thread::spawn(move || {
+            while !done.load(Ordering::Relaxed) {
+                let keep = me.wanted()
+                    && me
+                        .inner
+                        .lock()
+                        .unwrap()
+                        .target
+                        .as_ref()
+                        .is_some_and(|t| t.path == path && t.generation == generation);
+                if !keep {
+                    // SIGTERM rather than SIGKILL: the child releases the device
+                    // on the way out, and a UVC device left streaming wants a
+                    // replug.
+                    unsafe {
+                        libc::kill(pid, libc::SIGTERM);
+                    }
+                    return;
+                }
+                thread::sleep(Duration::from_millis(150));
+            }
+        });
+        stop
+    }
+
+    /// Whether this frame is still the one being asked for.
+    fn still_wanted(&self, target: &Target) -> bool {
+        self.wanted()
+            && self
+                .inner
+                .lock()
+                .unwrap()
+                .target
+                .as_ref()
+                .is_some_and(|t| t.path == target.path && t.generation == target.generation)
+    }
+
+    /// Record a decoded frame.
+    fn deliver(&self, rgb: Vec<u8>, w: u32, h: u32, seq: &mut u64) {
+        *seq += 1;
+        // 24 rather than 0: limited-range black is Y=16, and conversion rounding
+        // puts it a little either side.
+        let dark = rgb.iter().all(|&b| b <= 24);
+        let mut inner = self.inner.lock().unwrap();
+        inner.state.dark = dark;
+        inner.frame = Some(Frame { width: w, height: h, rgb, seq: *seq });
+        inner.state.frames = *seq;
+        inner.state.no_signal = false;
+    }
+
+    /// MJPEG through the GPU: decode, scale and convert before anything crosses
+    /// back to system memory.
+    ///
+    /// Everything the expensive way would be done on the CPU is in the filter
+    /// chain. `scale_vaapi` is the part that matters -- without it a full-size
+    /// frame has to be downloaded and the transfer costs what the decode saved.
+    /// The output is NV12 at preview size, 345 KB rather than 3.1 MB.
+    ///
+    /// Frames are fixed-size here, which is simpler than the software path: there
+    /// is no JPEG framing to do, because ffmpeg has already done it.
+    fn stream_accelerated(
+        self: &Arc<Self>,
+        target: &Target,
+        driver: &str,
+        width: u32,
+        height: u32,
+    ) -> Result<(), String> {
+        let (ow, oh) = preview_size(width, height);
+        let filter = format!("scale_vaapi=w={ow}:h={oh},hwdownload,format=nv12");
+        let size = format!("{width}x{height}");
+
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args([
+            "-hide_banner",
+            "-loglevel", "error",
+            "-hwaccel", "vaapi",
+            "-hwaccel_device", crate::vaapi::RENDER_NODE,
+            "-hwaccel_output_format", "vaapi",
+            "-f", "v4l2",
+            "-input_format", "mjpeg",
+            "-video_size", &size,
+            "-i", &target.path,
+            "-vf", &filter,
+            "-pix_fmt", "nv12",
+            "-f", "rawvideo",
+            "-",
+        ]);
+        if !driver.is_empty() {
+            // Per child, never for the whole system: a browser encoding a call
+            // later may prefer a different driver, and choosing one here must not
+            // choose it everywhere.
+            cmd.env("LIBVA_DRIVER_NAME", driver);
+        }
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("ffmpeg: {e}"))?;
+        let Some(mut out) = child.stdout.take() else {
+            let _ = child.kill();
+            return Err("ffmpeg produced no stdout".into());
+        };
+
+        {
+            let mut inner = self.inner.lock().unwrap();
+            inner.state.running = true;
+            inner.state.no_signal = false;
+            inner.state.error = None;
+        }
+        let stop = self.watch(child.id() as i32, target);
+
+        let frame_bytes = (ow as usize) * (oh as usize) * 3 / 2;
+        let mut nv12 = vec![0u8; frame_bytes];
+        let mut seq = self.inner.lock().unwrap().state.frames;
+        let mut delivered = 0u64;
+
+        // No no_signal timer here, unlike the software path, and its absence is
+        // deliberate. That path reads whatever arrives and can tell a partial
+        // frame from none; this one reads a fixed-size frame and blocks until it
+        // is whole, so there is no in-between state to observe. A source that
+        // stops simply blocks, and the watchdog is what ends it.
+        while self.still_wanted(target) {
+            match out.read_exact(&mut nv12) {
+                Ok(()) => {
+                    let rgb = nv12_to_rgb(&nv12, ow, oh);
+                    self.deliver(rgb, ow, oh, &mut seq);
+                    delivered += 1;
+                    thread::sleep(FRAME_INTERVAL);
+                }
+                Err(_) => break,
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = child.kill();
+        let _ = child.wait();
+        self.inner.lock().unwrap().state.running = false;
+
+        // Nothing at all means ffmpeg could not do it -- a driver that probed
+        // well but cannot actually stream, a filter that failed to configure.
+        // Reported so the caller falls back rather than showing a dead pane.
+        if delivered == 0 {
+            return Err("ffmpeg delivered no frames".into());
+        }
+        Ok(())
+    }
+
     /// One child's worth of streaming, from open until it stops or the target
     /// changes.
     fn stream(self: &Arc<Self>, target: &Target) {
@@ -188,6 +360,24 @@ impl Preview {
             thread::sleep(Duration::from_secs(1));
             return;
         };
+
+        // Hardware first for MJPEG, when a driver exists that can both decode it
+        // and post-process. Decided here rather than at build time: the same
+        // binary runs on units whose driver may be missing or broken, and one of
+        // those must still show a picture.
+        if fourcc == "MJPG" || fourcc == "JPEG" {
+            if let Some(accel) = crate::vaapi::accelerator_for(crate::vaapi::Codec::Jpeg) {
+                match self.stream_accelerated(target, &accel.driver_name, width, height) {
+                    Ok(()) => return,
+                    Err(e) => {
+                        // Falls through to software. Worth a line: a silent
+                        // downgrade to three times the CPU is the kind of thing
+                        // that is only ever noticed as a warm room.
+                        eprintln!("hub-hal: hardware decode unavailable ({e}); using software");
+                    }
+                }
+            }
+        }
 
         let child = Command::new("v4l2-ctl")
             .args(["-d", &target.path, "--stream-mmap", "--stream-to=-", "--silent"])
@@ -447,6 +637,38 @@ fn yuyv_to_rgb(raw: &[u8], width: u32, height: u32) -> (Vec<u8>, u32, u32) {
     (rgb, ow, oh)
 }
 
+/// NV12 to packed RGB, at preview size.
+///
+/// Cheap because it is already small: the GPU scaled before the download, so this
+/// is a few hundred pixels across rather than two million.
+///
+/// BT.601 with full-range luma, which is what this webcam reports -- ffmpeg shows
+/// the stream as `csp:bt470bg range:pc`. Deliberately different from the YUYV path
+/// above, which uses BT.709 because the capture card reports Rec. 709. Two devices,
+/// two colorimetries, and using one matrix for both would tint one of them.
+fn nv12_to_rgb(nv12: &[u8], width: u32, height: u32) -> Vec<u8> {
+    let (w, h) = (width as usize, height as usize);
+    let y_plane = w * h;
+    let mut rgb = vec![0u8; y_plane * 3];
+    if nv12.len() < y_plane + y_plane / 2 {
+        return rgb;
+    }
+    for y in 0..h {
+        for x in 0..w {
+            let luma = nv12[y * w + x] as f32;
+            // One chroma pair per 2x2 block of luma, interleaved U then V.
+            let c = y_plane + (y / 2) * w + (x / 2) * 2;
+            let u = nv12[c] as f32 - 128.0;
+            let v = nv12[c + 1] as f32 - 128.0;
+            let o = (y * w + x) * 3;
+            rgb[o] = clamp8(luma + 1.402 * v);
+            rgb[o + 1] = clamp8(luma - 0.344136 * u - 0.714136 * v);
+            rgb[o + 2] = clamp8(luma + 1.772 * u);
+        }
+    }
+    rgb
+}
+
 /// Nearest-neighbour downscale of packed RGB. Good enough for a preview and cheap
 /// enough to do on the same thread as the read.
 fn scale_rgb(src: &[u8], width: u32, height: u32) -> (Vec<u8>, u32, u32) {
@@ -511,6 +733,33 @@ mod tests {
         let red = [128u8, 128, 128, 240];
         let (rgb, _, _) = yuyv_to_rgb(&red, 2, 1);
         assert!(rgb[0] > rgb[1] && rgb[0] > rgb[2], "red -> {rgb:?}");
+    }
+
+    /// The NV12 path cannot be exercised without a camera and a GPU, so the
+    /// conversion is checked against hand-built planes the same way YUYV is.
+    #[test]
+    fn nv12_converts_known_pixels() {
+        // 2x2, one chroma pair. Full-range BT.601: neutral chroma is 128.
+        let white = [255u8, 255, 255, 255, 128, 128];
+        let rgb = nv12_to_rgb(&white, 2, 2);
+        assert!(rgb[0] > 250 && rgb[1] > 250 && rgb[2] > 250, "white -> {:?}", &rgb[..3]);
+
+        let black = [0u8, 0, 0, 0, 128, 128];
+        let rgb = nv12_to_rgb(&black, 2, 2);
+        assert!(rgb[0] < 5 && rgb[1] < 5 && rgb[2] < 5, "black -> {:?}", &rgb[..3]);
+
+        // V high: red dominates.
+        let red = [128u8, 128, 128, 128, 128, 240];
+        let rgb = nv12_to_rgb(&red, 2, 2);
+        assert!(rgb[0] > rgb[1] && rgb[0] > rgb[2], "red -> {:?}", &rgb[..3]);
+    }
+
+    #[test]
+    fn a_short_nv12_frame_does_not_panic() {
+        // A truncated read must produce a black frame rather than an index out
+        // of bounds on a wall-mounted device.
+        let rgb = nv12_to_rgb(&[0u8; 3], 4, 4);
+        assert_eq!(rgb.len(), 4 * 4 * 3);
     }
 
     #[test]
