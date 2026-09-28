@@ -27,6 +27,9 @@
 //!   a slow camera cannot stall whoever asked.
 //! - [`preview`] Live frames from one of those, for a preview pane. YUYV and
 //!   MJPEG, because the two devices here each offer only one of them.
+//! - [`vaapi`] What the GPU can decode and encode in hardware. Notably, this
+//!   chip decodes VP8 and VP9 but cannot encode either, which decides what codec
+//!   a call has to negotiate.
 //! - [`hid`] Read-only raw HID capture, for the undocumented devices.
 //! - [`inventory`] A one-shot description of the hardware.
 //! - [`util`] Process and file helpers every backend shares, including the
@@ -48,3 +51,4 @@ pub mod prox;
 pub mod screen;
 pub mod video;
 pub mod util;
+pub mod vaapi;

@@ -368,6 +368,44 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
+/// MJPEG to RGB at preview size, in software.
+///
+/// In software deliberately, and this is the record of why so nobody re-runs the
+/// experiment. The GPU here has a JPEG Baseline decoder -- [`crate::vaapi`] will
+/// tell you so -- and using it for this is not worth what it costs.
+///
+/// Measured on hub-002 with a real 1080p frame from the OBSBOT, 40 iterations:
+///
+/// ```text
+/// decode to RGB then downscale (this)      12.17 ms   of which decode is 10.91
+/// decode to YCbCr, convert only kept px    14.27 ms   +17%, worse
+/// jpeg-decoder at 1/2 scale (960x540)      11.21 ms   -3%
+/// jpeg-decoder at 1/4 scale (480x270)       8.82 ms   -23%, but below preview size
+/// ```
+///
+/// Two things fall out of that. The downscale costs 1.26 ms, so restructuring
+/// around it cannot help -- 90% of the time is the decode. And decoding at
+/// reduced DCT scale, which should have been the obvious win, is worth 3% at a
+/// size we can actually use, because jpeg-decoder is a slower decoder to begin
+/// with and its scaling gain pays for that rather than for us. Converting only
+/// the pixels the preview keeps is slower still: zune's colour conversion is
+/// vectorised and a scalar loop over the sampled pixels is not.
+///
+/// So software has no headroom, and hardware is the only real lever. At preview
+/// size it is not a lever worth pulling: 5 frames a second at 12 ms is 6% of one
+/// core of four, and the optimistic hardware figure saves maybe 8 ms of that --
+/// about 1% of the machine. Against that, the `libva` crate cannot be built on
+/// the control node (bindgen wants libclang and the VA headers, neither is
+/// installed and installing them needs a password nobody types), so it would mean
+/// hand-written unsafe FFI through `dlopen` against a C ABI with no headers
+/// available to check the struct layouts against, on units that hang on walls and
+/// are recovered by walking to them.
+///
+/// Where it does become worth it is rate, not size. The same 12 ms is 36% of a
+/// core at 30 fps and 73% at 60, and a call needs the encoder as well -- which on
+/// this chip is H.264 only, since it has no VP8 or VP9 encode at all. That work
+/// wants `libva-dev` and `libclang` on whatever builds the binary; `libva2` and
+/// `libva-drm2` are already on the hubs, pulled in by the driver.
 fn decode_jpeg(jpeg: &[u8]) -> Option<(Vec<u8>, u32, u32)> {
     let mut decoder = zune_jpeg::JpegDecoder::new(jpeg);
     let pixels = decoder.decode().ok()?;
