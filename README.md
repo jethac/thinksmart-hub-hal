@@ -24,6 +24,7 @@ Every number below was measured on these units. There is no datasheet.
 | `preview` | Live frames | `v4l2-ctl` writes progress markers to stdout, interleaved with frames, without `--silent` |
 | `vaapi` | GPU decode/encode capability | See below |
 | `screen` | Screenshots, via `grim` | These have no keyboard; this is how you see the screen over ssh |
+| `bluetooth` | The radio, nearby devices, pairing | The adapter is a combo part and comes up on its own, but nothing in userspace is installed by default. A discovery session dies with the D-Bus connection that started it, so scanning cannot be a one-shot |
 | `hid` | Raw HID capture | For undocumented devices, notably `17ef:60ce` |
 | `inventory` | One-shot hardware description | |
 | `util` | Bounded-child-process primitive | Everything external goes through it |
@@ -85,7 +86,45 @@ first because i965 is frozen upstream at 2.4.1, and falls back to i965.
 
 `LIBVA_DRIVER_NAME` is set per child process, never system-wide.
 
+## Bluetooth
+
+The Intel 8265 is a combo Wi-Fi/Bluetooth part, so the kernel brings up `hci0`
+unaided. Debian installs nothing to use it with: no `bluez`, no `bluetoothctl`,
+`bluetoothd` inactive. PipeWire's `libspa-0.2-bluetooth` may already be present,
+waiting for a stack that does not exist.
+
+Read through `busctl` rather than `bluetoothctl`. The latter is a REPL that
+prints a coloured event log; the former speaks the D-Bus API bluez actually
+exposes and renders replies as JSON. Two limits, both found the hard way:
+
+- `GetManagedObjects` cannot be rendered as JSON: busctl answers `Failed to
+  create new json object: Invalid argument`, because the reply type nests deeper
+  than its JSON writer handles. Use `busctl tree` plus one
+  `Properties.GetAll` per device.
+- A multi-property `get-property` fails entirely if any one property is absent,
+  and on BLE devices most are. `GetAll` returns what exists.
+
+**A discovery session belongs to the D-Bus connection that started it.**
+`busctl call ... StartDiscovery` returns success, the process exits, and
+`Discovering` is false a second later. Scanning has to hold a connection open
+for its duration: `bluetoothctl --timeout N scan on` as a held child.
+
+**Unpaired devices are transient.** In one 12-second scan here, 39 devices
+appeared and 23 had vanished between listing the paths and reading their
+properties. Skip them; that is the normal behaviour, not an error.
+
+Pairing needs an agent to answer bluez's prompts, which `bluetoothctl`
+registers and a raw `Device1.Pair` call does not.
+
+Most of what a scan finds in a house is nameless BLE randoms with no `Icon` and
+no `Class` — 16 of 16 on one run, 37 of 39 on another. Filter to paired devices
+plus recognised kinds or the list is unusable.
+
 ## Other traps
+
+- **`rfkill` is in `/usr/sbin`, which is not on an unprivileged non-login
+  `PATH`.** It reports `rfkill: not found` on a machine where it is installed
+  and working, which reads as "no Bluetooth" and is not.
 
 - `pgrep` cannot find a process whose name is 16+ characters: the kernel
   truncates `comm` to 15. `ps -C` and `pgrep -f` work.

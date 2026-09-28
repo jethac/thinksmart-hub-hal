@@ -30,6 +30,10 @@
 //! - [`vaapi`] What the GPU can decode and encode in hardware. Notably, this
 //!   chip decodes VP8 and VP9 but cannot encode either, which decides what codec
 //!   a call has to negotiate.
+//! - [`bluetooth`] The radio, what is nearby, and what is paired. A keyboard is
+//!   the only way to type at one of these, and a headset the only way to take a
+//!   call privately; a discovery session dies with the connection that started
+//!   it, which is why scanning is a held-open child rather than a one-shot.
 //! - [`hid`] Read-only raw HID capture, for the undocumented devices.
 //! - [`inventory`] A one-shot description of the hardware.
 //! - [`util`] Process and file helpers every backend shares, including the
@@ -40,6 +44,7 @@
 //! `docs/verified.md`). This crate turns them into code.
 
 pub mod audio;
+pub mod bluetooth;
 pub mod display;
 pub mod hid;
 pub mod inventory;
